@@ -1,4 +1,6 @@
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, DataCollatorForSeq2Seq, Seq2SeqTrainingArguments, Seq2SeqTrainer
+from datasets import load_metric
+import numpy as np
 import torch
 import pandas as pd
 from pathlib import Path
@@ -9,6 +11,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.ba
 PROJECT_PATH = Path(__file__).parent.parent.parent.resolve().__str__()
 TRAIN_INTERIM_PATH = PROJECT_PATH + "/data/interim/train/tokenized.tsv"
 TEST_INTERIM_PATH = PROJECT_PATH + "/data/interim/test/tokenized.tsv"
+CHECKPOINT_PATH = PROJECT_PATH + "/models/best"
 
 MAX_INPUT_LENGTH = 128
 MAX_TARGET_LENGTH = 128
@@ -16,6 +19,7 @@ MAX_TARGET_LENGTH = 128
 
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+metric = load_metric("sacrebleu")
 
 batch_size = 16
 args = Seq2SeqTrainingArguments(
@@ -40,6 +44,35 @@ def from_serias_to_tensor(array):
 
     return input_ids
 
+# simple postprocessing for text
+def postprocess_text(preds, labels):
+    preds = [pred.strip() for pred in preds]
+    labels = [[label.strip()] for label in labels]
+
+    return preds, labels
+
+# compute metrics function to pass to trainer
+def compute_metrics(eval_preds):
+    preds, labels = eval_preds
+    if isinstance(preds, tuple):
+        preds = preds[0]
+    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+    
+    # Replace -100 in the labels as we can't decode them.
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # Some simple post-processing
+    decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+
+    result = metric.compute(predictions=decoded_preds, references=decoded_labels)
+    result = {"bleu": result["score"]}
+
+    prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+    result["gen_len"] = np.mean(prediction_lens)
+    result = {k: round(v, 4) for k, v in result.items()}
+    return result
+
 class TokenizedDataset(Dataset):
     def __init__(self, dataset_path):
         tokenized_df = pd.read_csv(dataset_path, sep='\t')
@@ -62,6 +95,8 @@ trainer = Seq2SeqTrainer(
     args,
     train_dataset=train_tokenized_dataset,
     eval_dataset=test_tokenized_dataset,
+    compute_metrics=compute_metrics,
 )
 
 trainer.train()
+trainer.save_model(CHECKPOINT_PATH)
